@@ -331,6 +331,20 @@ func handleButton(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		// Handle approval
 		responseContent = fmt.Sprintf("<@%s> has been approved! Welcome to the server! 🎉", userID)
 
+		// Send DM to the approved user
+		dmChannel, err := s.UserChannelCreate(userID)
+		if err != nil {
+			log.Printf("Error creating DM channel: %v", err)
+			return
+		} else {
+			approvalMessage := "You have been approved to join the UCLan Computing Society server. Welcome! 🎉"
+
+			_, err = s.ChannelMessageSend(dmChannel.ID, approvalMessage)
+			if err != nil {
+				log.Printf("Error sending DM: %v", err)
+			}
+		}
+
 		// Remove unverified role
 		configMutex.RLock()
 		if serverConfig, exists := config.Servers[i.GuildID]; exists && serverConfig.UnverifiedRoleID != "" {
@@ -521,8 +535,7 @@ func guildMemberAdd(s *discordgo.Session, m *discordgo.GuildMemberAdd) {
 		fmt.Printf("Error creating DM channel: %v\n", err)
 		return
 	}
-
-	_, err = s.ChannelMessageSend(channel.ID, "Welcome! Please provide your university email for verification.")
+	_, err = s.ChannelMessageSend(channel.ID, "Welcome! Please provide your university email for verification. For example:```example@uclan.ac.uk```")
 	if err != nil {
 		fmt.Println("Error sending DM:", err)
 	}
