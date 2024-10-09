@@ -6,8 +6,11 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"regexp"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/joho/godotenv"
@@ -26,6 +29,12 @@ type Config struct {
 var (
 	config      Config
 	configMutex sync.RWMutex
+)
+
+var (
+	emailRegex    = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@uclan\.ac\.uk$`)
+	rateLimitMap  = make(map[string]time.Time)
+	rateLimitLock sync.Mutex
 )
 
 func loadConfig() error {
@@ -135,18 +144,29 @@ func main() {
 	}
 	log.Println("Successfully created Discord session")
 
-	// Register the messageCreate func as a callback for MessageCreate events.
-	client.AddHandler(guildMemberAdd)
-
-	// Handle slash commands
+	// Register handlers for different interaction types
 	client.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
-		if h, ok := commandHandlers[i.ApplicationCommandData().Name]; ok {
-			h(s, i)
+		switch i.Type {
+		case discordgo.InteractionApplicationCommand:
+			// Handle slash commands
+			if h, ok := commandHandlers[i.ApplicationCommandData().Name]; ok {
+				h(s, i)
+			}
+		case discordgo.InteractionMessageComponent:
+			// Handle button interactions
+			handleButton(s, i)
 		}
 	})
 
 	// Register the messageCreate func as a callback for MessageCreate events.
+	client.AddHandler(guildMemberAdd)
 	client.AddHandler(memberDM)
+
+	// Set required intents
+	client.Identify.Intents = discordgo.IntentsGuildMessages |
+		discordgo.IntentGuildMembers |
+		discordgo.IntentDirectMessages |
+		discordgo.IntentGuilds
 
 	// Retrieve the guild ID from the .env file
 	guildId := os.Getenv("GUILD_ID")
@@ -155,8 +175,6 @@ func main() {
 	} else {
 		log.Printf("Deploying commands to guild ID: %s\n", guildId)
 	}
-
-	client.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentGuildMembers | discordgo.IntentDirectMessages | discordgo.IntentGuilds
 
 	// Open a websocket connection to Discord and begin listening.
 	err = client.Open()
@@ -202,9 +220,24 @@ func memberDM(s *discordgo.Session, m *discordgo.MessageCreate) {
 }
 
 func processEmailVerification(s *discordgo.Session, m *discordgo.MessageCreate) {
-	// TODO: Implement email verification logic
+	// Check rate limit
+	rateLimitLock.Lock()
+	lastTime, exists := rateLimitMap[m.Author.ID]
+	now := time.Now()
+	if exists && now.Sub(lastTime) < 5*time.Minute {
+		rateLimitLock.Unlock()
+		s.ChannelMessageSend(m.ChannelID, "Please wait 5 minutes before sending another verification request.")
+		return
+	}
+	rateLimitMap[m.Author.ID] = now
+	rateLimitLock.Unlock()
 
-	// Find the guild ID for this user
+	// Validate email
+	if !emailRegex.MatchString(m.Content) {
+		s.ChannelMessageSend(m.ChannelID, "Invalid email. Please provide a valid UCLan email.")
+		return
+	}
+
 	guilds := s.State.Guilds
 	var guildID string
 	for _, guild := range guilds {
@@ -229,10 +262,137 @@ func processEmailVerification(s *discordgo.Session, m *discordgo.MessageCreate) 
 		return
 	}
 
+	// Approval button
+	approveButton := discordgo.Button{
+		Label:    "Approve",
+		Style:    discordgo.SuccessButton,
+		CustomID: "approve_" + m.Author.ID,
+	}
+
+	// Denial button
+	denyButton := discordgo.Button{
+		Label:    "Deny",
+		Style:    discordgo.DangerButton,
+		CustomID: "deny_" + m.Author.ID,
+	}
+
+	// Create action row
+	actionRow := discordgo.ActionsRow{
+		Components: []discordgo.MessageComponent{approveButton, denyButton},
+	}
+
 	// Send verification request to member audit channel
-	_, err := s.ChannelMessageSend(serverConfig.MemberAuditChannelID, fmt.Sprintf("User %s has requested verification with email %s", m.Author.ID, m.Content))
+	_, err := s.ChannelMessageSendComplex(serverConfig.MemberAuditChannelID, &discordgo.MessageSend{
+		Content:    fmt.Sprintf("User %s#%s has requested verification with email %s", m.Author.Username, m.Author.Discriminator, m.Content),
+		Components: []discordgo.MessageComponent{actionRow},
+	})
+
 	if err != nil {
 		log.Printf("Error sending message to audit channel: %v", err)
+	}
+}
+
+func handleButton(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Flags: discordgo.MessageFlagsEphemeral,
+		},
+	})
+
+	if err != nil {
+		log.Printf("Error acknowledging interaction: %v", err)
+		return
+	}
+
+	if i.Type != discordgo.InteractionMessageComponent {
+		log.Printf("Received non-component interaction: %v", i.Type)
+		return
+	}
+
+	customID := i.MessageComponentData().CustomID
+	log.Printf("Received button interaction: %s", customID)
+
+	// Split by underscore to properly separate action and userID
+	parts := strings.Split(customID, "_")
+	if len(parts) != 2 {
+		log.Printf("Invalid button customID format: %s", customID)
+		return
+	}
+
+	action := parts[0]
+	userID := parts[1]
+
+	log.Printf("Processing %s action for user %s", action, userID)
+
+	var responseContent string
+	switch action {
+	case "approve":
+		// Handle approval
+		responseContent = fmt.Sprintf("<@%s> has been approved! Welcome to the server! 🎉", userID)
+
+		// Remove unverified role
+		configMutex.RLock()
+		if serverConfig, exists := config.Servers[i.GuildID]; exists && serverConfig.UnverifiedRoleID != "" {
+			err := s.GuildMemberRoleRemove(i.GuildID, userID, serverConfig.UnverifiedRoleID)
+			if err != nil {
+				log.Printf("Error removing unverified role: %v", err)
+			}
+		}
+		configMutex.RUnlock()
+	case "deny":
+		// Send DM to the denied user before removing them
+		dmChannel, err := s.UserChannelCreate(userID)
+		if err != nil {
+			log.Printf("Error creating DM channel: %v", err)
+			return
+		} else {
+			denialMessage := "Oops! You need to verify your identity with a UCLan email address to access the UCLan Computing Society server. This is to ensure only society members have access to the server and ensure we keep a safe and civil community.\n\nAs you did not verify your email, you were kicked from the server. You can rejoin and retry verification using this link: https://discord.gg/CEgCy5ejag. Thank you 🙂"
+
+			_, err = s.ChannelMessageSend(dmChannel.ID, denialMessage)
+			if err != nil {
+				log.Printf("Error sending DM: %v", err)
+			}
+		}
+		// Kick the member
+		err = s.GuildMemberDelete(i.GuildID, userID)
+		if err != nil {
+			log.Printf("Error kicking user %s: %v", userID, err)
+			errorContent := "Error processing denial"
+			s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+				Content: &errorContent,
+			})
+			return
+		}
+
+		responseContent = fmt.Sprintf("<@%s> has been denied and removed from the server.", userID)
+	default:
+		log.Printf("Unknown action: %s", action)
+		unknownContent := "Unknown action"
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: &unknownContent,
+		})
+		return
+	}
+
+	// Update the original message to remove buttons and show the result
+	_, err = s.ChannelMessageEditComplex(&discordgo.MessageEdit{
+		Channel:    i.ChannelID,
+		ID:         i.Message.ID,
+		Content:    &responseContent,
+		Components: &[]discordgo.MessageComponent{},
+	})
+	if err != nil {
+		log.Printf("Error editing original message: %v", err)
+	}
+
+	// Edit the deferred response
+	completionMessage := "Action completed successfully"
+	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: &completionMessage,
+	})
+	if err != nil {
+		log.Printf("Error editing interaction response: %v", err)
 	}
 }
 
@@ -260,8 +420,6 @@ func setVerificationChannel(s *discordgo.Session, i *discordgo.InteractionCreate
 		})
 		return
 	}
-
-	// TODO: Save channelId to config
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
@@ -295,8 +453,6 @@ func setMemberAuditChannel(s *discordgo.Session, i *discordgo.InteractionCreate)
 		})
 		return
 	}
-
-	// TODO: Save channelId to config
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
