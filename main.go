@@ -38,7 +38,7 @@ var (
 )
 
 func loadConfig() error {
-	data, err := os.ReadFile("config.json")
+	data, err := os.ReadFile("./data/config.json")
 	if err != nil {
 		if os.IsNotExist(err) {
 			config = Config{Servers: make(map[string]ServerConfig)}
@@ -58,7 +58,12 @@ func saveConfig() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile("config.json", data, 0644)
+
+	err = os.MkdirAll("./data", os.ModePerm)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile("./data/config.json", data, 0644)
 }
 
 var (
