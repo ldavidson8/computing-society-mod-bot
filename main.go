@@ -17,9 +17,10 @@ import (
 )
 
 type ServerConfig struct {
-	VerificationChannelID string `json:"verification_channel_id"`
-	MemberAuditChannelID  string `json:"member_audit_channel_id"`
-	UnverifiedRoleID      string `json:"unverified_role_id"`
+	MemberAuditChannelID string        `json:"member_audit_channel_id"`
+	UnverifiedRoleID     string        `json:"unverified_role_id"`
+	RateLimitEnabled     bool          `json:"rate_limit_enabled"`
+	RateLimitDuration    time.Duration `json:"rate_limit_duration"`
 }
 
 type Config struct {
@@ -68,24 +69,15 @@ func saveConfig() error {
 
 var (
 	commandHandlers = map[string]func(s *discordgo.Session, i *discordgo.InteractionCreate){
-		"set_verification_channel": setVerificationChannel,
 		"set_member_audit_channel": setMemberAuditChannel,
 		"set_unverified_role":      setUnverifiedRole,
+		"enable_rate_limit":        enableRateLimit,
+		"disable_rate_limit":       disableRateLimit,
+		"set_rate_limit":           setRateLimit,
+		"check_rate_limit":         checkRateLimit,
 	}
 
 	commands = []*discordgo.ApplicationCommand{
-		{
-			Name:        "set_verification_channel",
-			Description: "Set the verification channel",
-			Options: []*discordgo.ApplicationCommandOption{
-				{
-					Type:        discordgo.ApplicationCommandOptionChannel,
-					Name:        "channel",
-					Description: "The channel to set as the verification channel",
-					Required:    true,
-				},
-			},
-		},
 		{
 			Name:        "set_member_audit_channel",
 			Description: "Set the member audit channel",
@@ -109,6 +101,30 @@ var (
 					Required:    true,
 				},
 			},
+		},
+		{
+			Name:        "enable_rate_limit",
+			Description: "Enable rate limiting for email verification",
+		},
+		{
+			Name:        "disable_rate_limit",
+			Description: "Disable rate limiting for email verification",
+		},
+		{
+			Name:        "set_rate_limit",
+			Description: "Set the rate limit for email verification",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionInteger,
+					Name:        "minutes",
+					Description: "The number of minutes to set the rate limit to",
+					Required:    true,
+				},
+			},
+		},
+		{
+			Name:        "check_rate_limit",
+			Description: "Check the current rate limit status",
 		},
 	}
 )
@@ -225,17 +241,27 @@ func memberDM(s *discordgo.Session, m *discordgo.MessageCreate) {
 }
 
 func processEmailVerification(s *discordgo.Session, m *discordgo.MessageCreate) {
-	// Check rate limit
-	rateLimitLock.Lock()
-	lastTime, exists := rateLimitMap[m.Author.ID]
-	now := time.Now()
-	if exists && now.Sub(lastTime) < 5*time.Minute {
-		rateLimitLock.Unlock()
-		s.ChannelMessageSend(m.ChannelID, "Please wait 5 minutes before sending another verification request.")
+	configMutex.RLock()
+	serverConfig, exists := config.Servers[m.GuildID]
+	configMutex.RUnlock()
+
+	if !exists {
+		log.Printf("No config found for guild %s", m.GuildID)
 		return
 	}
-	rateLimitMap[m.Author.ID] = now
-	rateLimitLock.Unlock()
+
+	if serverConfig.RateLimitEnabled {
+		rateLimitLock.Lock()
+		lastTime, exists := rateLimitMap[m.Author.ID]
+		now := time.Now()
+		if exists && now.Sub(lastTime) < serverConfig.RateLimitDuration {
+			rateLimitLock.Unlock()
+			s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("Please wait %d minutes before sending another verification request.", serverConfig.RateLimitDuration/time.Minute))
+			return
+		}
+		rateLimitMap[m.Author.ID] = now
+		rateLimitLock.Unlock()
+	}
 
 	// Validate email
 	if !emailRegex.MatchString(m.Content) {
@@ -259,13 +285,8 @@ func processEmailVerification(s *discordgo.Session, m *discordgo.MessageCreate) 
 	}
 
 	configMutex.RLock()
-	serverConfig, exists := config.Servers[guildID]
+	serverConfig = config.Servers[guildID]
 	configMutex.RUnlock()
-
-	if !exists || serverConfig.VerificationChannelID == "" {
-		log.Printf("No member audit channel configured for guild %s", guildID)
-		return
-	}
 
 	// Approval button
 	approveButton := discordgo.Button{
@@ -415,39 +436,6 @@ func handleButton(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	}
 }
 
-func setVerificationChannel(s *discordgo.Session, i *discordgo.InteractionCreate) {
-	options := i.ApplicationCommandData().Options
-	channelID := options[0].ChannelValue(s).ID
-	guildID := i.GuildID
-
-	configMutex.Lock()
-	if _, exists := config.Servers[guildID]; !exists {
-		config.Servers[guildID] = ServerConfig{}
-	}
-	serverConfig := config.Servers[guildID]
-	serverConfig.VerificationChannelID = channelID
-	config.Servers[guildID] = serverConfig
-	configMutex.Unlock()
-
-	err := saveConfig()
-	if err != nil {
-		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-			Type: discordgo.InteractionResponseChannelMessageWithSource,
-			Data: &discordgo.InteractionResponseData{
-				Content: "Error saving config: " + err.Error(),
-			},
-		})
-		return
-	}
-
-	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseChannelMessageWithSource,
-		Data: &discordgo.InteractionResponseData{
-			Content: fmt.Sprintf("Verification channel set successfully! :white_check_mark: <#%s>", channelID),
-		},
-	})
-}
-
 func setMemberAuditChannel(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	options := i.ApplicationCommandData().Options
 	channelID := options[0].ChannelValue(s).ID
@@ -510,6 +498,140 @@ func setUnverifiedRole(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
 			Content: fmt.Sprintf("Verified role set successfully! :white_check_mark: <@&%s>", roleID),
+		},
+	})
+}
+
+func enableRateLimit(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	guildID := i.GuildID
+
+	configMutex.Lock()
+	if _, exists := config.Servers[guildID]; !exists {
+		config.Servers[guildID] = ServerConfig{}
+	}
+
+	serverConfig := config.Servers[guildID]
+	serverConfig.RateLimitEnabled = true
+	if serverConfig.RateLimitDuration == 0 {
+		serverConfig.RateLimitDuration = 5 * time.Minute // Default to 5 minutes
+	}
+
+	config.Servers[guildID] = serverConfig
+	configMutex.Unlock()
+
+	err := saveConfig()
+	if err != nil {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Error saving config: " + err.Error(),
+			},
+		})
+		return
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: "Rate limiting enabled successfully! :white_check_mark:",
+		},
+	})
+}
+
+func disableRateLimit(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	guildID := i.GuildID
+
+	configMutex.Lock()
+	if _, exists := config.Servers[guildID]; !exists {
+		config.Servers[guildID] = ServerConfig{}
+	}
+
+	serverConfig := config.Servers[guildID]
+	serverConfig.RateLimitEnabled = false
+	config.Servers[guildID] = serverConfig
+	configMutex.Unlock()
+
+	err := saveConfig()
+	if err != nil {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Error saving config: " + err.Error(),
+			},
+		})
+		return
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: "Rate limiting disabled successfully! :white_check_mark:",
+		},
+	})
+}
+
+func setRateLimit(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	options := i.ApplicationCommandData().Options
+	minutes := options[0].IntValue()
+	guildID := i.GuildID
+
+	configMutex.Lock()
+	if _, exists := config.Servers[guildID]; !exists {
+		config.Servers[guildID] = ServerConfig{}
+	}
+
+	serverConfig := config.Servers[guildID]
+	serverConfig.RateLimitDuration = time.Duration(minutes) * time.Minute
+	config.Servers[guildID] = serverConfig
+	configMutex.Unlock()
+
+	err := saveConfig()
+	if err != nil {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Error saving config: " + err.Error(),
+			},
+		})
+		return
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: fmt.Sprintf("Rate limit set to %d minutes successfully! :white_check_mark:", minutes),
+		},
+	})
+}
+
+func checkRateLimit(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	guildID := i.GuildID
+
+	configMutex.RLock()
+	serverConfig, exists := config.Servers[guildID]
+	configMutex.RUnlock()
+
+	if !exists {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "No rate limit configured for this server",
+			},
+		})
+		return
+	}
+
+	var content string
+	if serverConfig.RateLimitEnabled {
+		content = fmt.Sprintf("Rate limit is enabled with a duration of %d minutes", int(serverConfig.RateLimitDuration/time.Minute))
+	} else {
+		content = "Rate limit is disabled"
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: content,
 		},
 	})
 }
