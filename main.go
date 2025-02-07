@@ -16,6 +16,8 @@ import (
 	"github.com/joho/godotenv"
 )
 
+var defaultAdminPerms = int64(discordgo.PermissionAdministrator)
+
 type ServerConfig struct {
 	MemberAuditChannelID string        `json:"member_audit_channel_id"`
 	UnverifiedRoleID     string        `json:"unverified_role_id"`
@@ -75,6 +77,7 @@ var (
 		"disable_rate_limit":       disableRateLimit,
 		"set_rate_limit":           setRateLimit,
 		"check_rate_limit":         checkRateLimit,
+		"verify_members":           verifyMembers,
 	}
 
 	commands = []*discordgo.ApplicationCommand{
@@ -125,6 +128,31 @@ var (
 		{
 			Name:        "check_rate_limit",
 			Description: "Check the current rate limit status",
+		},
+		{
+			Name:                     "verify_members",
+			Description:              "Send verification messages to members with specific roles",
+			DefaultMemberPermissions: &defaultAdminPerms,
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionBoolean,
+					Name:        "everyone",
+					Description: "Verify all members (except excluded roles and bots)",
+					Required:    true,
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionRole,
+					Name:        "include_role",
+					Description: "Role to include in the verification (ignored if everyone is true)",
+					Required:    false,
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionRole,
+					Name:        "exclude_role",
+					Description: "Role to exclude from the verification",
+					Required:    false,
+				},
+			},
 		},
 	}
 )
@@ -666,4 +694,81 @@ func guildMemberAdd(s *discordgo.Session, m *discordgo.GuildMemberAdd) {
 	if err != nil {
 		fmt.Println("Error sending DM:", err)
 	}
+}
+
+func verifyMembers(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// Acknowledge the command
+	err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: "Processing verification messages...",
+		},
+	})
+
+	if err != nil {
+		log.Printf("Error acknowledging interaction: %v", err)
+		return
+	}
+
+	options := i.ApplicationCommandData().Options
+	includeRole := options[0].RoleValue(s, i.GuildID)
+	var excludeRole *discordgo.Role
+	if len(options) > 1 {
+		excludeRole = options[1].RoleValue(s, i.GuildID)
+	}
+
+	// Get all guild members
+	members, err := s.GuildMembers(i.GuildID, "", 1000)
+	if err != nil {
+		log.Printf("Error fetching guild members: %v", err)
+		var messageContent = "Error fetching guild members"
+		s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+			Content: &messageContent,
+		})
+		return
+	}
+
+	var messagesSent int
+	for _, member := range members {
+		// Skip if member has the exclude role
+		if excludeRole != nil && hasRole(member.Roles, excludeRole.ID) {
+			continue
+		}
+
+		// Send message if member has include role
+		if hasRole(member.Roles, includeRole.ID) {
+			dmChannel, err := s.UserChannelCreate(member.User.ID)
+			if err != nil {
+				log.Printf("Error creating DM channel: %v", err)
+				continue
+			}
+
+			_, err = s.ChannelMessageSend(dmChannel.ID,
+				"Welcome! Please provide your university email for verification. For example:```example@uclan.ac.uk```")
+			if err != nil {
+				log.Printf("Error sending DM to %s: %v", member.User.ID, err)
+				continue
+			}
+			messagesSent++
+		}
+	}
+
+	// Update response
+	content := fmt.Sprintf("Sent verification messages to %d members", messagesSent)
+	_, err = s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content: &content,
+	})
+	if err != nil {
+		log.Printf("Error editing interaction response: %v", err)
+	}
+}
+
+// Helper function to check if a member has a role
+func hasRole(memberRoles []string, roleID string) bool {
+	for _, role := range memberRoles {
+		if role == roleID {
+			return true
+		}
+	}
+	return false
 }
